@@ -5,27 +5,80 @@ import requests
 import plotly.graph_objects as go
 import io
 
-# 1. Page config with mobile sidebar collapsed by default
+# Optional Groww API imports
+try:
+    import pyotp
+    from growwapi import GrowwAPI
+    GROWW_SDK_AVAILABLE = True
+except ImportError:
+    GROWW_SDK_AVAILABLE = False
+
+# 1. Page Configuration
 st.set_page_config(
-    page_title="10/20 EMA Fast Terminal",
+    page_title="10/20 EMA Strategy Terminal",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# 2. Mobile & Performance UI Styling
+# 2. Inject Mobile-Responsive CSS Styling
 st.markdown("""
     <style>
-    .block-container { padding-top: 1rem !important; padding-bottom: 1rem !important; padding-left: 0.5rem !important; padding-right: 0.5rem !important; }
+    .block-container { 
+        padding-top: 1rem !important; 
+        padding-bottom: 1rem !important; 
+        padding-left: 0.5rem !important; 
+        padding-right: 0.5rem !important; 
+    }
     @media (max-width: 768px) {
-        div[data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; }
-        div[data-testid="column"] { min-width: 48% !important; margin-bottom: 8px !important; }
+        div[data-testid="stHorizontalBlock"] { 
+            flex-wrap: wrap !important; 
+        }
+        div[data-testid="column"] { 
+            min-width: 48% !important; 
+            margin-bottom: 8px !important; 
+        }
     }
     </style>
 """, unsafe_allow_html=True)
 
 st.title("⚡ 10/20 EMA Fast Strategy Terminal")
 
-# Cache Symbol Master List (24 Hours)
+# 3. Secure Groww API Authentication Helper
+@st.cache_resource(ttl=1800)
+def init_groww_client():
+    if not GROWW_SDK_AVAILABLE:
+        return None
+    
+    # Check if 'groww' block exists in Streamlit Secrets
+    if "groww" in st.secrets:
+        credentials = st.secrets["groww"]
+        api_key = credentials.get("GROWW_API_KEY")
+        secret_key = credentials.get("GROWW_SECRET_KEY")
+        totp_secret = credentials.get("GROWW_TOTP_SECRET")
+
+        if api_key and (secret_key or totp_secret):
+            try:
+                if totp_secret:
+                    totp_val = pyotp.TOTP(totp_secret).now()
+                    access_token = GrowwAPI.get_access_token(api_key=api_key, totp=totp_val)
+                else:
+                    access_token = GrowwAPI.get_access_token(api_key=api_key, secret=secret_key)
+                
+                return GrowwAPI(access_token)
+            except Exception as e:
+                st.sidebar.warning(f"Groww API Auth Failed: {e}. Defaulting to yfinance.")
+                return None
+    return None
+
+groww_client = init_groww_client()
+
+# Display API connection status in sidebar
+if groww_client is not None:
+    st.sidebar.success("🟢 Connected to Groww Live API")
+else:
+    st.sidebar.info("🔵 Using yfinance Batch Feed")
+
+# 4. Symbol Master List Loader (Cached 24 Hours)
 @st.cache_data(ttl=86400)
 def load_nse_symbols():
     fallback_list = [
@@ -55,7 +108,7 @@ WATCHLISTS = {
     "Custom Selection": []
 }
 
-# Sidebar Controls
+# 5. Sidebar Navigation
 st.sidebar.header("⚙️ Settings")
 mode = st.sidebar.selectbox("Watchlist", list(WATCHLISTS.keys()))
 
@@ -68,7 +121,7 @@ timeframe = st.sidebar.selectbox("Timeframe", ["15m", "60m", "1d"], index=2)
 period = st.sidebar.selectbox("Period", ["1mo", "3mo", "6mo"], index=1)
 rr_ratio = st.sidebar.slider("Risk-Reward Ratio (1:X)", min_value=1.0, max_value=3.0, value=2.0, step=0.5)
 
-# High-Speed Batch Data Engine (Cached 60 sec)
+# 6. High-Speed Batch Engine
 @st.cache_data(ttl=60)
 def fetch_batch_data(symbols_tuple, p, tf):
     if not symbols_tuple:
@@ -78,7 +131,16 @@ def fetch_batch_data(symbols_tuple, p, tf):
     results = {}
     
     try:
-        data = yf.download(symbols, period=p, interval=tf, group_by='ticker', progress=False, threads=True)
+        data = yf.download(
+            symbols, 
+            period=p, 
+            interval=tf, 
+            group_by='ticker', 
+            progress=False, 
+            threads=True,
+            auto_adjust=False,
+            actions=False
+        )
         
         for symbol in symbols:
             try:
@@ -100,13 +162,18 @@ def fetch_batch_data(symbols_tuple, p, tf):
                 open_series = df['Open'].squeeze()
 
                 df_clean = pd.DataFrame({
-                    'Open': open_series, 'High': high_series, 'Low': low_series, 'Close': close_series
+                    'Open': open_series, 
+                    'High': high_series, 
+                    'Low': low_series, 
+                    'Close': close_series
                 }, index=df.index).dropna()
 
+                # Exponential Moving Averages
                 df_clean['EMA_10'] = df_clean['Close'].ewm(span=10, adjust=False).mean()
                 df_clean['EMA_20'] = df_clean['Close'].ewm(span=20, adjust=False).mean()
                 df_clean['EMA_50'] = df_clean['Close'].ewm(span=50, adjust=False).mean()
 
+                # Strategy Rules
                 df_clean['Uptrend'] = (df_clean['Close'] > df_clean['EMA_50']) & (df_clean['EMA_10'] > df_clean['EMA_20'])
                 df_clean['Near_20EMA'] = (df_clean['Low'] <= df_clean['EMA_20'] * 1.008) & (df_clean['Close'] >= df_clean['EMA_20'] * 0.985)
                 df_clean['Buy_Signal'] = df_clean['Uptrend'] & df_clean['Near_20EMA']
@@ -208,15 +275,15 @@ with tab2:
 
         fig.update_layout(
             title=f"{chart_ticker} — Trade Levels",
-            yaxis_title="Price (INR)", xasis_rangeslider_visible=False, template="plotly_dark", height=380, margin=dict(l=10, r=10, t=35, b=10)
+            yaxis_title="Price (INR)", xaxis_rangeslider_visible=False, template="plotly_dark", height=380, margin=dict(l=10, r=10, t=35, b=10)
         )
         st.plotly_chart(fig, use_container_width=True, config={'responsive': True})
 
-# TAB 3: LIVE POSITIONS (CLEAN SLATE INITIALIZATION)
+# TAB 3: LIVE POSITIONS
 with tab3:
     st.subheader("💼 Active Holdings & Dynamic TSL")
     
-    # Clean slate initialization with no hardcoded pre-defined positions
+    # Initialize clean state with zero hardcoded sample positions
     if "positions" not in st.session_state:
         st.session_state.positions = []
 
@@ -283,7 +350,6 @@ with tab3:
                         st.toast(f"Exited {exited_item['Ticker']}!")
                         st.rerun()
 
-        # Visual Trailing SL Chart Inspector
         st.divider()
         st.subheader("📉 Trailing SL Chart Inspector")
         active_tickers = [p["Ticker"] for p in st.session_state.positions]
