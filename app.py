@@ -4,14 +4,8 @@ import pandas as pd
 import requests
 import plotly.graph_objects as go
 import io
-
-# Optional Groww API imports
-try:
-    import pyotp
-    from growwapi import GrowwAPI
-    GROWW_SDK_AVAILABLE = True
-except ImportError:
-    GROWW_SDK_AVAILABLE = False
+import json
+import os
 
 # 1. Page Configuration
 st.set_page_config(
@@ -43,49 +37,38 @@ st.markdown("""
 
 st.title("⚡ 10/20 EMA Fast Strategy Terminal")
 
-# 3. Secure Groww API Authentication Helper
-@st.cache_resource(ttl=1800)
-def init_groww_client():
-    if not GROWW_SDK_AVAILABLE:
-        return None
-    
-    # Check if 'groww' block exists in Streamlit Secrets
-    if "groww" in st.secrets:
-        credentials = st.secrets["groww"]
-        api_key = credentials.get("GROWW_API_KEY")
-        secret_key = credentials.get("GROWW_SECRET_KEY")
-        totp_secret = credentials.get("GROWW_TOTP_SECRET")
+# 3. File-Based Persistence Helpers (No Hardcoded Positions)
+POSITIONS_FILE = "positions.json"
 
-        if api_key and (secret_key or totp_secret):
-            try:
-                if totp_secret:
-                    totp_val = pyotp.TOTP(totp_secret).now()
-                    access_token = GrowwAPI.get_access_token(api_key=api_key, totp=totp_val)
-                else:
-                    access_token = GrowwAPI.get_access_token(api_key=api_key, secret=secret_key)
-                
-                return GrowwAPI(access_token)
-            except Exception as e:
-                st.sidebar.warning(f"Groww API Auth Failed: {e}. Defaulting to yfinance.")
-                return None
-    return None
+def load_saved_positions():
+    """Loads positions from local file if available, else returns empty list."""
+    if os.path.exists(POSITIONS_FILE):
+        try:
+            with open(POSITIONS_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
 
-groww_client = init_groww_client()
+def save_positions(positions):
+    """Saves active positions to local JSON file for session persistence."""
+    try:
+        with open(POSITIONS_FILE, "w") as f:
+            json.dump(positions, f, indent=4)
+    except Exception as e:
+        st.error(f"Failed to save positions to disk: {e}")
 
-# Display API connection status in sidebar
-if groww_client is not None:
-    st.sidebar.success("🟢 Connected to Groww Live API")
-else:
-    st.sidebar.info("🔵 Using yfinance Batch Feed")
+if "positions" not in st.session_state:
+    st.session_state.positions = load_saved_positions()
 
 # 4. Symbol Master List Loader (Cached 24 Hours)
 @st.cache_data(ttl=86400)
 def load_nse_symbols():
     fallback_list = [
-        "PERSISTENT.NS", "MANKIND.NS", "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", 
+        "DRREDDY.NS", "MANKIND.NS", "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", 
         "ICICIBANK.NS", "BHARTIARTL.NS", "SBIN.NS", "TATAMOTORS.NS", "BAJFINANCE.NS", 
-        "SUNPHARMA.NS", "TITAN.NS", "CIPLA.NS", "DRREDDY.NS", "WIPRO.NS", "HCLTECH.NS", 
-        "COFORGE.NS", "LTTS.NS", "DIXON.NS"
+        "SUNPHARMA.NS", "TITAN.NS", "CIPLA.NS", "WIPRO.NS", "HCLTECH.NS", 
+        "COFORGE.NS", "LTTS.NS", "DIXON.NS", "PERSISTENT.NS"
     ]
     try:
         url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
@@ -102,18 +85,18 @@ def load_nse_symbols():
 ALL_NSE_STOCKS = load_nse_symbols()
 
 WATCHLISTS = {
-    "IT & Tech": ["PERSISTENT.NS", "LTTS.NS", "COFORGE.NS", "TCS.NS", "INFY.NS", "WIPRO.NS", "HCLTECH.NS"],
+    "Pharma & Healthcare": ["DRREDDY.NS", "MANKIND.NS", "SUNPHARMA.NS", "CIPLA.NS", "TORNTPHARM.NS"],
+    "IT & Tech": ["LTTS.NS", "COFORGE.NS", "TCS.NS", "INFY.NS", "WIPRO.NS", "HCLTECH.NS", "PERSISTENT.NS"],
     "Nifty Core": ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS", "BHARTIARTL.NS", "SBIN.NS"],
-    "Pharma & Healthcare": ["MANKIND.NS", "SUNPHARMA.NS", "CIPLA.NS", "DRREDDY.NS", "TORNTPHARM.NS"],
     "Custom Selection": []
 }
 
-# 5. Sidebar Navigation
+# 5. Sidebar Controls
 st.sidebar.header("⚙️ Settings")
 mode = st.sidebar.selectbox("Watchlist", list(WATCHLISTS.keys()))
 
 if mode == "Custom Selection":
-    selected_stocks = st.sidebar.multiselect("Pick Stocks:", options=ALL_NSE_STOCKS, default=["PERSISTENT.NS", "MANKIND.NS", "RELIANCE.NS"])
+    selected_stocks = st.sidebar.multiselect("Pick Stocks:", options=ALL_NSE_STOCKS, default=["DRREDDY.NS", "MANKIND.NS", "RELIANCE.NS"])
 else:
     selected_stocks = WATCHLISTS[mode]
 
@@ -121,13 +104,13 @@ timeframe = st.sidebar.selectbox("Timeframe", ["15m", "60m", "1d"], index=2)
 period = st.sidebar.selectbox("Period", ["1mo", "3mo", "6mo"], index=1)
 rr_ratio = st.sidebar.slider("Risk-Reward Ratio (1:X)", min_value=1.0, max_value=3.0, value=2.0, step=0.5)
 
-# 6. High-Speed Batch Engine
+# 6. Robust Batch Data Processing Engine
 @st.cache_data(ttl=60)
 def fetch_batch_data(symbols_tuple, p, tf):
     if not symbols_tuple:
         return {}
     
-    symbols = list(symbols_tuple)
+    symbols = list(set(symbols_tuple))
     results = {}
     
     try:
@@ -142,24 +125,38 @@ def fetch_batch_data(symbols_tuple, p, tf):
             actions=False
         )
         
+        if data.empty:
+            return {}
+
         for symbol in symbols:
             try:
                 if len(symbols) == 1:
-                    df = data.copy()
+                    if isinstance(data.columns, pd.MultiIndex):
+                        if symbol in data.columns.levels[0]:
+                            df = data[symbol].copy()
+                        else:
+                            df = data.xs(symbol, axis=1, level=1).copy() if symbol in data.columns.levels[1] else data.copy()
+                    else:
+                        df = data.copy()
                 else:
-                    if symbol in data.columns.levels[0]:
-                        df = data[symbol].copy()
+                    if isinstance(data.columns, pd.MultiIndex):
+                        if symbol in data.columns.levels[0]:
+                            df = data[symbol].copy()
+                        elif symbol in data.columns.levels[1]:
+                            df = data.xs(symbol, axis=1, level=1).copy()
+                        else:
+                            continue
                     else:
                         continue
                 
-                df = df.dropna()
-                if df.empty or len(df) < 50:
+                df = df.dropna(how='all')
+                if df.empty or len(df) < 20:
                     continue
 
-                close_series = df['Close'].squeeze()
-                low_series = df['Low'].squeeze()
-                high_series = df['High'].squeeze()
-                open_series = df['Open'].squeeze()
+                close_series = df['Close'].squeeze().astype(float)
+                low_series = df['Low'].squeeze().astype(float)
+                high_series = df['High'].squeeze().astype(float)
+                open_series = df['Open'].squeeze().astype(float)
 
                 df_clean = pd.DataFrame({
                     'Open': open_series, 
@@ -168,7 +165,7 @@ def fetch_batch_data(symbols_tuple, p, tf):
                     'Close': close_series
                 }, index=df.index).dropna()
 
-                # Exponential Moving Averages
+                # Calculate EMAs
                 df_clean['EMA_10'] = df_clean['Close'].ewm(span=10, adjust=False).mean()
                 df_clean['EMA_20'] = df_clean['Close'].ewm(span=20, adjust=False).mean()
                 df_clean['EMA_50'] = df_clean['Close'].ewm(span=50, adjust=False).mean()
@@ -237,10 +234,12 @@ with tab1:
     else:
         st.info("Select tickers in the sidebar.")
 
-# TAB 2: DETAILED TRADE SETUP
+# TAB 2: DETAILED TRADE SETUP CHART
 with tab2:
     chart_ticker = st.selectbox("Select Ticker for Charting:", ALL_NSE_STOCKS, index=0)
-    chart_data_dict = fetch_batch_data((chart_ticker,), period, timeframe)
+    
+    with st.spinner(f"Loading candlestick chart for {chart_ticker}..."):
+        chart_data_dict = fetch_batch_data((chart_ticker,), period, timeframe)
 
     if chart_ticker in chart_data_dict:
         df_single = chart_data_dict[chart_ticker]
@@ -263,7 +262,12 @@ with tab2:
 
         fig = go.Figure()
         fig.add_trace(go.Candlestick(
-            x=df_single.index, open=df_single['Open'], high=df_single['High'], low=df_single['Low'], close=df_single['Close'], name="Price"
+            x=df_single.index, 
+            open=df_single['Open'], 
+            high=df_single['High'], 
+            low=df_single['Low'], 
+            close=df_single['Close'], 
+            name="Price"
         ))
         fig.add_trace(go.Scatter(x=df_single.index, y=df_single['EMA_10'], line=dict(color='orange', width=1.5), name="10 EMA"))
         fig.add_trace(go.Scatter(x=df_single.index, y=df_single['EMA_20'], line=dict(color='blue', width=2), name="20 EMA"))
@@ -274,36 +278,58 @@ with tab2:
         fig.add_hline(y=target_price, line_dash="dash", line_color="cyan", annotation_text="TGT")
 
         fig.update_layout(
-            title=f"{chart_ticker} — Trade Levels",
-            yaxis_title="Price (INR)", xaxis_rangeslider_visible=False, template="plotly_dark", height=380, margin=dict(l=10, r=10, t=35, b=10)
+            title=f"{chart_ticker} — Technical Setup & Levels",
+            yaxis_title="Price (INR)", 
+            xaxis_rangeslider_visible=False, 
+            template="plotly_dark", 
+            height=420, 
+            margin=dict(l=10, r=10, t=35, b=10)
         )
         st.plotly_chart(fig, use_container_width=True, config={'responsive': True})
+    else:
+        st.error(f"Could not load market data for {chart_ticker}. Please pick another stock or refresh.")
 
-# TAB 3: LIVE POSITIONS
+# TAB 3: USER DYNAMIC LIVE POSITIONS
 with tab3:
     st.subheader("💼 Active Holdings & Dynamic TSL")
-    
-    # Initialize clean state with zero hardcoded sample positions
-    if "positions" not in st.session_state:
-        st.session_state.positions = []
 
-    with st.expander("➕ Add Open Position"):
+    # Form to add custom user positions
+    with st.expander("➕ Add New Position", expanded=len(st.session_state.positions) == 0):
         with st.form("add_pos_form"):
             p_symbol = st.selectbox("Ticker", ALL_NSE_STOCKS, index=0)
+            
+            # Dynamically auto-fill price and calculated SL if available
+            with st.spinner("Fetching live metrics for auto-fill..."):
+                auto_data = fetch_batch_data((p_symbol,), period, timeframe)
+                if p_symbol in auto_data:
+                    default_buy = float(auto_data[p_symbol]['Close'].iloc[-1])
+                    default_ema50 = float(auto_data[p_symbol]['EMA_50'].iloc[-1])
+                    default_swing = float(auto_data[p_symbol]['Low'].tail(5).min())
+                    default_sl = min(default_swing, default_ema50 * 0.995)
+                else:
+                    default_buy = 1000.0
+                    default_sl = 970.0
+
             c1, c2 = st.columns(2)
-            p_price = c1.number_input("Buy Price (₹)", min_value=1.0, value=2000.0, step=10.0)
+            p_price = c1.number_input("Buy Price (₹)", min_value=1.0, value=round(default_buy, 2), step=1.0)
             p_qty = c2.number_input("Quantity", min_value=1, value=10, step=1)
-            p_sl = st.number_input("Initial SL Price (₹)", min_value=1.0, value=1950.0, step=10.0)
+            p_sl = st.number_input("Initial SL Price (₹)", min_value=1.0, value=round(default_sl, 2), step=1.0)
             
             if st.form_submit_button("Add Position", use_container_width=True):
-                st.session_state.positions.append({
-                    "Ticker": p_symbol, "Buy_Price": float(p_price), "Qty": int(p_qty), "Initial_SL": float(p_sl)
-                })
-                st.toast(f"Added {p_symbol}!")
+                new_entry = {
+                    "Ticker": p_symbol, 
+                    "Buy_Price": float(p_price), 
+                    "Qty": int(p_qty), 
+                    "Initial_SL": float(p_sl)
+                }
+                st.session_state.positions.append(new_entry)
+                save_positions(st.session_state.positions)
+                st.toast(f"Added position for {p_symbol}!")
                 st.rerun()
 
-    if not st.session_state.positions:
-        st.info("No active open positions tracked. Expand 'Add Open Position' above to start monitoring live holdings.")
+    # Display active positions
+    if len(st.session_state.positions) == 0:
+        st.info("💡 No active positions found. Use the 'Add New Position' form above to track your open trades.")
     else:
         pos_tickers = tuple(p["Ticker"] for p in st.session_state.positions)
         pos_data_dict = fetch_batch_data(pos_tickers, period, timeframe)
@@ -345,18 +371,21 @@ with tab3:
                     r2_c2.write(f"**TSL:** ₹{active_tsl:.2f}\n**Buf:** {tsl_dist:.1f}%")
                     
                     st.caption(f"Status: **{rec}**")
-                    if st.button("🚪 Exit Position", key=f"exit_{idx}", type="primary", use_container_width=True):
-                        exited_item = st.session_state.positions.pop(idx)
-                        st.toast(f"Exited {exited_item['Ticker']}!")
+                    if st.button("门 Exit Position", key=f"exit_{idx}", type="primary", use_container_width=True):
+                        st.session_state.positions.pop(idx)
+                        save_positions(st.session_state.positions)
+                        st.toast(f"Exited {pos['Ticker']}!")
                         st.rerun()
 
+        # Dynamic Position Chart Inspector
         st.divider()
         st.subheader("📉 Trailing SL Chart Inspector")
         active_tickers = [p["Ticker"] for p in st.session_state.positions]
-        pos_select = st.selectbox("Select Position:", active_tickers)
         
-        selected_pos_data = next(p for p in st.session_state.positions if p["Ticker"] == pos_select)
-        if pos_select in pos_data_dict:
+        pos_select = st.selectbox("Select Active Position:", active_tickers, index=0)
+        selected_pos_data = next((p for p in st.session_state.positions if p["Ticker"] == pos_select), None)
+        
+        if selected_pos_data and pos_select in pos_data_dict:
             df_pos_chart = pos_data_dict[pos_select]
             e10_c = float(df_pos_chart['EMA_10'].iloc[-1])
             e20_c = float(df_pos_chart['EMA_20'].iloc[-1])
@@ -375,15 +404,17 @@ with tab3:
             fig_p.add_hline(y=tsl_line_val, line_dash="solid", line_color="orange", annotation_text="TSL")
 
             fig_p.update_layout(
-                title=f"{pos_select} — Trailing SL",
+                title=f"{pos_select} — Trailing Stop Loss Chart",
                 yaxis_title="Price (INR)",
                 xaxis_rangeslider_visible=False,
                 template="plotly_dark",
-                height=380,
+                height=420,
                 margin=dict(l=10, r=10, t=35, b=10)
             )
             st.plotly_chart(fig_p, use_container_width=True, config={'responsive': True})
 
         if st.button("🗑️ Clear All Positions", use_container_width=True):
             st.session_state.positions = []
+            save_positions([])
+            st.toast("Cleared all open positions!")
             st.rerun()
