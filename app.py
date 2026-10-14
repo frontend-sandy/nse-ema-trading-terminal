@@ -37,8 +37,9 @@ st.markdown("""
 
 st.title("⚡ 10/20 EMA Fast Strategy Terminal")
 
-# 3. File-Based Persistence Helpers (No Hardcoded Positions)
+# 3. File-Based Persistence Helpers
 POSITIONS_FILE = "positions.json"
+WATCHLIST_FILE = "watchlist.json"
 
 def load_saved_positions():
     """Loads positions from local file if available, else returns empty list."""
@@ -58,8 +59,30 @@ def save_positions(positions):
     except Exception as e:
         st.error(f"Failed to save positions to disk: {e}")
 
+def load_saved_watchlist():
+    """Loads custom 10-stock watchlist from local JSON file."""
+    if os.path.exists(WATCHLIST_FILE):
+        try:
+            with open(WATCHLIST_FILE, "r") as f:
+                saved = json.load(f)
+                return saved[:10] if isinstance(saved, list) else []
+        except Exception:
+            pass
+    return ["DRREDDY.NS", "COFORGE.NS", "LTTS.NS", "PERSISTENT.NS", "RELIANCE.NS"]
+
+def save_watchlist(watchlist):
+    """Saves active custom watchlist (up to 10 tickers) to local JSON file."""
+    try:
+        with open(WATCHLIST_FILE, "w") as f:
+            json.dump(watchlist[:10], f, indent=4)
+    except Exception as e:
+        st.error(f"Failed to save watchlist to disk: {e}")
+
 if "positions" not in st.session_state:
     st.session_state.positions = load_saved_positions()
+
+if "custom_watchlist" not in st.session_state:
+    st.session_state.custom_watchlist = load_saved_watchlist()
 
 # 4. Symbol Master List Loader (Cached 24 Hours)
 @st.cache_data(ttl=86400)
@@ -93,10 +116,10 @@ WATCHLISTS = {
 
 # 5. Sidebar Controls
 st.sidebar.header("⚙️ Settings")
-mode = st.sidebar.selectbox("Watchlist", list(WATCHLISTS.keys()))
+mode = st.sidebar.selectbox("Watchlist Preset", list(WATCHLISTS.keys()))
 
 if mode == "Custom Selection":
-    selected_stocks = st.sidebar.multiselect("Pick Stocks:", options=ALL_NSE_STOCKS, default=["DRREDDY.NS", "MANKIND.NS", "RELIANCE.NS"])
+    selected_stocks = st.sidebar.multiselect("Pick Stocks (Preset):", options=ALL_NSE_STOCKS, default=["DRREDDY.NS", "MANKIND.NS", "RELIANCE.NS"])
 else:
     selected_stocks = WATCHLISTS[mode]
 
@@ -183,10 +206,103 @@ def fetch_batch_data(symbols_tuple, p, tf):
         
     return results
 
-tab1, tab2, tab3 = st.tabs(["🚀 Fast Scanner", "📊 Chart Setup", "💼 Live Positions"])
+tab1, tab2, tab3, tab4 = st.tabs(["📺 Live 10-Watchlist", "🚀 Fast Scanner", "📊 Chart Setup", "💼 Live Positions"])
 
-# TAB 1: FAST SCANNER
+# Fast Position Lookup Dictionary
+pos_lookup = {p["Ticker"]: p for p in st.session_state.positions}
+
+# TAB 1: LIVE 10-STOCK WATCHLIST
 with tab1:
+    st.subheader("📺 Customized Live Watchlist (Max 10 Tickers)")
+    
+    # Watchlist multiselect strictly capped at 10 items
+    updated_watchlist = st.multiselect(
+        "Select up to 10 stocks to monitor live:",
+        options=ALL_NSE_STOCKS,
+        default=[s for s in st.session_state.custom_watchlist if s in ALL_NSE_STOCKS],
+        max_selections=10,
+        key="watchlist_multiselect"
+    )
+
+    if updated_watchlist != st.session_state.custom_watchlist:
+        st.session_state.custom_watchlist = updated_watchlist
+        save_watchlist(updated_watchlist)
+
+    w_col1, w_col2 = st.columns([3, 1])
+    w_col1.caption(f"Currently Watching: **{len(st.session_state.custom_watchlist)} / 10** tickers")
+    if w_col2.button("🔄 Refresh Live Feed", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    if st.session_state.custom_watchlist:
+        with st.spinner("Fetching live feed for watchlist..."):
+            wl_data_dict = fetch_batch_data(tuple(st.session_state.custom_watchlist), period, timeframe)
+            
+        wl_cards = []
+        for symbol in st.session_state.custom_watchlist:
+            if symbol in wl_data_dict:
+                df_wl = wl_data_dict[symbol]
+                latest = df_wl.iloc[-1]
+                prev = df_wl.iloc[-2] if len(df_wl) > 1 else latest
+                
+                close = float(latest['Close'])
+                prev_close = float(prev['Close'])
+                chg = close - prev_close
+                chg_pct = (chg / prev_close) * 100 if prev_close else 0.0
+                
+                ema10 = float(latest['EMA_10'])
+                ema20 = float(latest['EMA_20'])
+                ema50 = float(latest['EMA_50'])
+                
+                if latest['Buy_Signal']:
+                    sig = "🔥 BUY ZONE"
+                elif latest['Uptrend']:
+                    sig = "⚡ Uptrend"
+                else:
+                    sig = "⚠️ Inactive"
+
+                wl_cards.append({
+                    "Symbol": symbol,
+                    "Live Price": close,
+                    "Change": chg,
+                    "Change %": chg_pct,
+                    "10 EMA": ema10,
+                    "20 EMA": ema20,
+                    "50 EMA": ema50,
+                    "Status": sig
+                })
+
+        if wl_cards:
+            grid_cols = st.columns(2)
+            for idx, item in enumerate(wl_cards):
+                col = grid_cols[idx % 2]
+                with col:
+                    with st.container(border=True):
+                        c_header, c_status = st.columns([2, 1])
+                        c_header.markdown(f"### {item['Symbol']}")
+                        
+                        if "BUY ZONE" in item['Status']:
+                            c_status.error(item['Status'])
+                        elif "Uptrend" in item['Status']:
+                            c_status.success(item['Status'])
+                        else:
+                            c_status.info(item['Status'])
+
+                        m_p1, m_p2, m_p3 = st.columns(3)
+                        m_p1.metric(
+                            "Live Price", 
+                            f"₹{item['Live Price']:.2f}", 
+                            delta=f"{item['Change']:+.2f} ({item['Change %']:+.2f}%)"
+                        )
+                        m_p2.metric("10 EMA", f"₹{item['10 EMA']:.2f}")
+                        m_p3.metric("20 EMA", f"₹{item['20 EMA']:.2f}")
+        else:
+            st.warning("Could not load data for selected watchlist stocks.")
+    else:
+        st.info("Pick stocks in the box above to populate your live watchlist.")
+
+# TAB 2: FAST SCANNER
+with tab2:
     st.subheader(f"Watchlist Scan ({len(selected_stocks)} Tickers)")
     
     if st.button("🔄 Force Refresh Cache", use_container_width=True):
@@ -203,13 +319,22 @@ with tab1:
                 df = stock_data_dict[symbol]
                 latest = df.iloc[-1]
                 close = float(latest['Close'])
-                ema20 = float(latest['EMA_20'])
                 ema50 = float(latest['EMA_50'])
                 
-                recent_swing_low = float(df['Low'].tail(5).min())
-                sl_price = min(recent_swing_low, ema50 * 0.995)
-                risk = max(close - sl_price, close * 0.01)
-                target_price = close + (risk * rr_ratio)
+                if symbol in pos_lookup:
+                    holding = pos_lookup[symbol]
+                    buy_price = holding["Buy_Price"]
+                    sl_price = holding["Initial_SL"]
+                    risk = max(buy_price - sl_price, buy_price * 0.01)
+                    target_price = buy_price + (risk * rr_ratio)
+                    is_holding = True
+                else:
+                    buy_price = close
+                    recent_swing_low = float(df['Low'].tail(5).min())
+                    sl_price = min(recent_swing_low, ema50 * 0.995)
+                    risk = max(close - sl_price, close * 0.01)
+                    target_price = close + (risk * rr_ratio)
+                    is_holding = False
                 
                 if latest['Buy_Signal']:
                     status = "🔥 BUY ZONE"
@@ -218,12 +343,15 @@ with tab1:
                 else:
                     status = "⚠️ Inactive"
 
+                if is_holding:
+                    status += " (Holding)"
+
                 scan_results.append({
                     "Ticker": symbol,
-                    "Price": f"₹{close:.2f}",
-                    "Buy": f"₹{close:.2f}" if status != "⚠️ Inactive" else "-",
-                    "SL": f"₹{sl_price:.2f}" if status != "⚠️ Inactive" else "-",
-                    "Target": f"₹{target_price:.2f}" if status != "⚠️ Inactive" else "-",
+                    "Live Price": f"₹{close:.2f}",
+                    "Buy": f"₹{buy_price:.2f}",
+                    "SL": f"₹{sl_price:.2f}",
+                    "Target": f"₹{target_price:.2f}",
                     "Status": status
                 })
 
@@ -234,9 +362,10 @@ with tab1:
     else:
         st.info("Select tickers in the sidebar.")
 
-# TAB 2: DETAILED TRADE SETUP CHART
-with tab2:
+# TAB 3: DETAILED TRADE SETUP CHART
+with tab3:
     chart_ticker = st.selectbox("Select Ticker for Charting:", ALL_NSE_STOCKS, index=0)
+    saved_pos = pos_lookup.get(chart_ticker, None)
     
     with st.spinner(f"Loading candlestick chart for {chart_ticker}..."):
         chart_data_dict = fetch_batch_data((chart_ticker,), period, timeframe)
@@ -246,15 +375,38 @@ with tab2:
         latest = df_single.iloc[-1]
         close = float(latest['Close'])
         ema50 = float(latest['EMA_50'])
+
+        default_buy = saved_pos["Buy_Price"] if saved_pos else close
         
-        swing_low = float(df_single['Low'].tail(5).min())
-        sl_price = min(swing_low, ema50 * 0.995)
-        risk = max(close - sl_price, close * 0.01)
-        target_price = close + (risk * rr_ratio)
+        c_e1, c_e2 = st.columns(2)
+        user_buy_price = c_e1.number_input(
+            "Your Buy Price (₹)", 
+            min_value=1.0, 
+            value=float(round(default_buy, 2)), 
+            step=1.0, 
+            key=f"buy_input_{chart_ticker}"
+        )
+        
+        if saved_pos and abs(user_buy_price - saved_pos["Buy_Price"]) < 0.01:
+            sl_price = saved_pos["Initial_SL"]
+        else:
+            swing_low = float(df_single['Low'].tail(5).min())
+            sl_price = min(swing_low, ema50 * 0.995)
+
+        sl_input = c_e2.number_input(
+            "Stop Loss Price (₹)", 
+            min_value=1.0, 
+            value=float(round(sl_price, 2)), 
+            step=1.0, 
+            key=f"sl_input_{chart_ticker}"
+        )
+
+        risk = max(user_buy_price - sl_input, user_buy_price * 0.01)
+        target_price = user_buy_price + (risk * rr_ratio)
 
         m1, m2 = st.columns(2)
-        m1.metric("🟢 Entry Buy", f"₹{close:.2f}")
-        m2.metric("🔴 Stop Loss (SL)", f"₹{sl_price:.2f}", delta=f"-₹{risk:.2f}", delta_color="inverse")
+        m1.metric("🟢 Entry Buy", f"₹{user_buy_price:.2f}")
+        m2.metric("🔴 Stop Loss (SL)", f"₹{sl_input:.2f}", delta=f"-₹{risk:.2f}", delta_color="inverse")
         
         m3, m4 = st.columns(2)
         m3.metric("🎯 Target Price", f"₹{target_price:.2f}", delta=f"+₹{risk * rr_ratio:.2f}")
@@ -273,12 +425,12 @@ with tab2:
         fig.add_trace(go.Scatter(x=df_single.index, y=df_single['EMA_20'], line=dict(color='blue', width=2), name="20 EMA"))
         fig.add_trace(go.Scatter(x=df_single.index, y=df_single['EMA_50'], line=dict(color='purple', width=2), name="50 EMA"))
 
-        fig.add_hline(y=close, line_dash="dash", line_color="green", annotation_text="BUY")
-        fig.add_hline(y=sl_price, line_dash="dash", line_color="red", annotation_text="SL")
+        fig.add_hline(y=user_buy_price, line_dash="dash", line_color="green", annotation_text="BUY")
+        fig.add_hline(y=sl_input, line_dash="dash", line_color="red", annotation_text="SL")
         fig.add_hline(y=target_price, line_dash="dash", line_color="cyan", annotation_text="TGT")
 
         fig.update_layout(
-            title=f"{chart_ticker} — Technical Setup & Levels",
+            title=f"{chart_ticker} — Technical Setup (RR {rr_ratio}:1)",
             yaxis_title="Price (INR)", 
             xaxis_rangeslider_visible=False, 
             template="plotly_dark", 
@@ -289,17 +441,15 @@ with tab2:
     else:
         st.error(f"Could not load market data for {chart_ticker}. Please pick another stock or refresh.")
 
-# TAB 3: USER DYNAMIC LIVE POSITIONS
-with tab3:
+# TAB 4: USER DYNAMIC LIVE POSITIONS
+with tab4:
     st.subheader("💼 Active Holdings & Dynamic TSL")
 
-    # Form to add custom user positions
     with st.expander("➕ Add New Position", expanded=len(st.session_state.positions) == 0):
         with st.form("add_pos_form"):
             p_symbol = st.selectbox("Ticker", ALL_NSE_STOCKS, index=0)
             
-            # Dynamically auto-fill price and calculated SL if available
-            with st.spinner("Fetching live metrics for auto-fill..."):
+            with st.spinner("Fetching market levels..."):
                 auto_data = fetch_batch_data((p_symbol,), period, timeframe)
                 if p_symbol in auto_data:
                     default_buy = float(auto_data[p_symbol]['Close'].iloc[-1])
@@ -311,7 +461,7 @@ with tab3:
                     default_sl = 970.0
 
             c1, c2 = st.columns(2)
-            p_price = c1.number_input("Buy Price (₹)", min_value=1.0, value=round(default_buy, 2), step=1.0)
+            p_price = c1.number_input("Your Buy Price (₹)", min_value=1.0, value=round(default_buy, 2), step=1.0)
             p_qty = c2.number_input("Quantity", min_value=1, value=10, step=1)
             p_sl = st.number_input("Initial SL Price (₹)", min_value=1.0, value=round(default_sl, 2), step=1.0)
             
@@ -327,7 +477,6 @@ with tab3:
                 st.toast(f"Added position for {p_symbol}!")
                 st.rerun()
 
-    # Display active positions
     if len(st.session_state.positions) == 0:
         st.info("💡 No active positions found. Use the 'Add New Position' form above to track your open trades.")
     else:
@@ -342,79 +491,6 @@ with tab3:
                 ema10 = float(latest['EMA_10'])
                 ema20 = float(latest['EMA_20'])
                 
-                pnl = (curr_price - pos["Buy_Price"]) * pos["Qty"]
-                pnl_pct = ((curr_price - pos["Buy_Price"]) / pos["Buy_Price"]) * 100
-                
-                raw_tsl = max(ema10, ema20) if curr_price > pos["Buy_Price"] else pos["Initial_SL"]
-                active_tsl = max(pos["Initial_SL"], raw_tsl * 0.995)
-                tsl_dist = ((curr_price - active_tsl) / curr_price) * 100
-                
-                if curr_price <= pos["Initial_SL"]:
-                    rec = "🚨 EXIT NOW (SL Hit)"
-                elif curr_price <= active_tsl:
-                    rec = "⚠️ TRAIL SL BROKEN (Exit)"
-                elif curr_price > pos["Buy_Price"] and ema10 > ema20:
-                    rec = "🔥 RIDE THE RALLY" if pnl_pct >= 5.0 else "🟢 HOLD & RIDE"
-                else:
-                    rec = "🟡 HOLD"
-
-                with st.container(border=True):
-                    r1_c1, r1_c2 = st.columns([2, 1])
-                    r1_c1.markdown(f"### {pos['Ticker']}")
-                    if pnl >= 0:
-                        r1_c2.success(f"₹{pnl:+.2f} ({pnl_pct:+.1f}%)")
-                    else:
-                        r1_c2.error(f"₹{pnl:+.2f} ({pnl_pct:+.1f}%)")
-                    
-                    r2_c1, r2_c2 = st.columns(2)
-                    r2_c1.write(f"**Live:** ₹{curr_price:.2f}\n**Qty:** {pos['Qty']}")
-                    r2_c2.write(f"**TSL:** ₹{active_tsl:.2f}\n**Buf:** {tsl_dist:.1f}%")
-                    
-                    st.caption(f"Status: **{rec}**")
-                    if st.button("门 Exit Position", key=f"exit_{idx}", type="primary", use_container_width=True):
-                        st.session_state.positions.pop(idx)
-                        save_positions(st.session_state.positions)
-                        st.toast(f"Exited {pos['Ticker']}!")
-                        st.rerun()
-
-        # Dynamic Position Chart Inspector
-        st.divider()
-        st.subheader("📉 Trailing SL Chart Inspector")
-        active_tickers = [p["Ticker"] for p in st.session_state.positions]
-        
-        pos_select = st.selectbox("Select Active Position:", active_tickers, index=0)
-        selected_pos_data = next((p for p in st.session_state.positions if p["Ticker"] == pos_select), None)
-        
-        if selected_pos_data and pos_select in pos_data_dict:
-            df_pos_chart = pos_data_dict[pos_select]
-            e10_c = float(df_pos_chart['EMA_10'].iloc[-1])
-            e20_c = float(df_pos_chart['EMA_20'].iloc[-1])
-            tsl_line_val = max(selected_pos_data["Initial_SL"], min(e10_c, e20_c))
-
-            fig_p = go.Figure()
-            fig_p.add_trace(go.Candlestick(
-                x=df_pos_chart.index,
-                open=df_pos_chart['Open'], high=df_pos_chart['High'], low=df_pos_chart['Low'], close=df_pos_chart['Close'],
-                name="Price"
-            ))
-            fig_p.add_trace(go.Scatter(x=df_pos_chart.index, y=df_pos_chart['EMA_10'], line=dict(color='orange', width=2), name="10 EMA"))
-            fig_p.add_trace(go.Scatter(x=df_pos_chart.index, y=df_pos_chart['EMA_20'], line=dict(color='blue', width=2), name="20 EMA"))
-
-            fig_p.add_hline(y=selected_pos_data["Buy_Price"], line_dash="dash", line_color="green", annotation_text="BUY")
-            fig_p.add_hline(y=tsl_line_val, line_dash="solid", line_color="orange", annotation_text="TSL")
-
-            fig_p.update_layout(
-                title=f"{pos_select} — Trailing Stop Loss Chart",
-                yaxis_title="Price (INR)",
-                xaxis_rangeslider_visible=False,
-                template="plotly_dark",
-                height=420,
-                margin=dict(l=10, r=10, t=35, b=10)
-            )
-            st.plotly_chart(fig_p, use_container_width=True, config={'responsive': True})
-
-        if st.button("🗑️ Clear All Positions", use_container_width=True):
-            st.session_state.positions = []
-            save_positions([])
-            st.toast("Cleared all open positions!")
-            st.rerun()
+                buy_price = pos["Buy_Price"]
+                init_sl = pos["Initial_SL"]
+                risk_per_share = max(buy_price - init_sl, buy_price * 0.01)
