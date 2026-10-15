@@ -14,7 +14,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# 2. Inject Mobile-Responsive CSS Styling
+# 2. Inject Mobile-Responsive & Metric Auto-Fit CSS
 st.markdown("""
     <style>
     .block-container { 
@@ -22,6 +22,16 @@ st.markdown("""
         padding-bottom: 1rem !important; 
         padding-left: 0.5rem !important; 
         padding-right: 0.5rem !important; 
+    }
+    /* Fix Metric Number Truncation */
+    div[data-testid="stMetricValue"] {
+        font-size: 1.15rem !important;
+        white-space: nowrap !important;
+        overflow: visible !important;
+    }
+    div[data-testid="stMetricLabel"] {
+        font-size: 0.85rem !important;
+        font-weight: 600 !important;
     }
     @media (max-width: 768px) {
         div[data-testid="stHorizontalBlock"] { 
@@ -215,7 +225,6 @@ pos_lookup = {p["Ticker"]: p for p in st.session_state.positions}
 with tab1:
     st.subheader("📺 Customized Live Watchlist (Max 10 Tickers)")
     
-    # Watchlist multiselect strictly capped at 10 items
     updated_watchlist = st.multiselect(
         "Select up to 10 stocks to monitor live:",
         options=ALL_NSE_STOCKS,
@@ -249,9 +258,6 @@ with tab1:
                 prev_close = float(prev['Close'])
                 chg = close - prev_close
                 chg_pct = (chg / prev_close) * 100 if prev_close else 0.0
-                
-                ema10 = float(latest['EMA_10'])
-                ema20 = float(latest['EMA_20'])
                 ema50 = float(latest['EMA_50'])
                 
                 if latest['Buy_Signal']:
@@ -261,14 +267,55 @@ with tab1:
                 else:
                     sig = "⚠️ Inactive"
 
+                # Check position holding status
+                is_holding = symbol in pos_lookup
+                if is_holding:
+                    sig += " (Holding)"
+
+                pnl_val = 0.0
+                pnl_pct = 0.0
+
+                if is_holding:
+                    holding = pos_lookup[symbol]
+                    buy_val = holding["Buy_Price"]
+                    sl_val = holding["Initial_SL"]
+                    qty = holding.get("Qty", 1)
+                    risk = max(buy_val - sl_val, buy_val * 0.01)
+                    target_val = buy_val + (risk * rr_ratio)
+                    
+                    pnl_val = (close - buy_val) * qty
+                    pnl_pct = ((close - buy_val) / buy_val) * 100 if buy_val else 0.0
+
+                    buy_str = f"₹{buy_val:.2f}"
+                    sl_str = f"₹{sl_val:.2f}"
+                    target_str = f"₹{target_val:.2f}"
+                elif "Inactive" not in sig:
+                    buy_price = close
+                    recent_swing_low = float(df_wl['Low'].tail(5).min())
+                    sl_price = min(recent_swing_low, ema50 * 0.995)
+                    risk = max(close - sl_price, close * 0.01)
+                    target_price = close + (risk * rr_ratio)
+                    
+                    buy_str = f"₹{buy_price:.2f}"
+                    sl_str = f"₹{sl_price:.2f}"
+                    target_str = f"₹{target_price:.2f}"
+                else:
+                    # Inactive non-holding stock
+                    buy_str = "-"
+                    sl_str = "-"
+                    target_str = "-"
+
                 wl_cards.append({
                     "Symbol": symbol,
                     "Live Price": close,
                     "Change": chg,
                     "Change %": chg_pct,
-                    "10 EMA": ema10,
-                    "20 EMA": ema20,
-                    "50 EMA": ema50,
+                    "Buy": buy_str,
+                    "SL": sl_str,
+                    "Target": target_str,
+                    "Is_Holding": is_holding,
+                    "PnL_Val": pnl_val,
+                    "PnL_Pct": pnl_pct,
                     "Status": sig
                 })
 
@@ -288,14 +335,27 @@ with tab1:
                         else:
                             c_status.info(item['Status'])
 
-                        m_p1, m_p2, m_p3 = st.columns(3)
-                        m_p1.metric(
+                        m_row1_1, m_row1_2 = st.columns(2)
+                        m_row1_1.metric(
                             "Live Price", 
                             f"₹{item['Live Price']:.2f}", 
                             delta=f"{item['Change']:+.2f} ({item['Change %']:+.2f}%)"
                         )
-                        m_p2.metric("10 EMA", f"₹{item['10 EMA']:.2f}")
-                        m_p3.metric("20 EMA", f"₹{item['20 EMA']:.2f}")
+
+                        if item['Is_Holding']:
+                            m_row1_2.metric(
+                                "PnL", 
+                                f"₹{item['PnL_Val']:+.2f}", 
+                                delta=f"{item['PnL_Pct']:+.2f}%"
+                            )
+                            m_row2_1, m_row2_2 = st.columns(2)
+                            m_row2_1.metric("Entry Buy", item['Buy'])
+                            m_row2_2.metric("Target (SL)", item['Target'], delta=f"SL: {item['SL']}", delta_color="off")
+                        else:
+                            m_row1_2.metric("Entry Buy", item['Buy'])
+                            m_row2_1, m_row2_2 = st.columns(2)
+                            m_row2_1.metric("Stop Loss", item['SL'])
+                            m_row2_2.metric("Target", item['Target'])
         else:
             st.warning("Could not load data for selected watchlist stocks.")
     else:
@@ -321,21 +381,6 @@ with tab2:
                 close = float(latest['Close'])
                 ema50 = float(latest['EMA_50'])
                 
-                if symbol in pos_lookup:
-                    holding = pos_lookup[symbol]
-                    buy_price = holding["Buy_Price"]
-                    sl_price = holding["Initial_SL"]
-                    risk = max(buy_price - sl_price, buy_price * 0.01)
-                    target_price = buy_price + (risk * rr_ratio)
-                    is_holding = True
-                else:
-                    buy_price = close
-                    recent_swing_low = float(df['Low'].tail(5).min())
-                    sl_price = min(recent_swing_low, ema50 * 0.995)
-                    risk = max(close - sl_price, close * 0.01)
-                    target_price = close + (risk * rr_ratio)
-                    is_holding = False
-                
                 if latest['Buy_Signal']:
                     status = "🔥 BUY ZONE"
                 elif latest['Uptrend']:
@@ -343,15 +388,49 @@ with tab2:
                 else:
                     status = "⚠️ Inactive"
 
+                is_holding = symbol in pos_lookup
                 if is_holding:
                     status += " (Holding)"
+
+                if is_holding:
+                    holding = pos_lookup[symbol]
+                    buy_val = holding["Buy_Price"]
+                    sl_val = holding["Initial_SL"]
+                    qty = holding.get("Qty", 1)
+                    risk = max(buy_val - sl_val, buy_val * 0.01)
+                    target_val = buy_val + (risk * rr_ratio)
+                    
+                    pnl_val = (close - buy_val) * qty
+                    pnl_pct = ((close - buy_val) / buy_val) * 100 if buy_val else 0.0
+                    
+                    buy_str = f"₹{buy_val:.2f}"
+                    sl_str = f"₹{sl_val:.2f}"
+                    target_str = f"₹{target_val:.2f}"
+                    pnl_str = f"₹{pnl_val:+.2f} ({pnl_pct:+.2f}%)"
+                elif "Inactive" not in status:
+                    buy_price = close
+                    recent_swing_low = float(df['Low'].tail(5).min())
+                    sl_price = min(recent_swing_low, ema50 * 0.995)
+                    risk = max(close - sl_price, close * 0.01)
+                    target_price = close + (risk * rr_ratio)
+                    
+                    buy_str = f"₹{buy_price:.2f}"
+                    sl_str = f"₹{sl_price:.2f}"
+                    target_str = f"₹{target_price:.2f}"
+                    pnl_str = "-"
+                else:
+                    buy_str = "-"
+                    sl_str = "-"
+                    target_str = "-"
+                    pnl_str = "-"
 
                 scan_results.append({
                     "Ticker": symbol,
                     "Live Price": f"₹{close:.2f}",
-                    "Buy": f"₹{buy_price:.2f}",
-                    "SL": f"₹{sl_price:.2f}",
-                    "Target": f"₹{target_price:.2f}",
+                    "Buy": buy_str,
+                    "SL": sl_str,
+                    "Target": target_str,
+                    "PnL": pnl_str,
                     "Status": status
                 })
 
@@ -494,3 +573,87 @@ with tab4:
                 buy_price = pos["Buy_Price"]
                 init_sl = pos["Initial_SL"]
                 risk_per_share = max(buy_price - init_sl, buy_price * 0.01)
+                pos_target = buy_price + (risk_per_share * rr_ratio)
+                
+                pnl = (curr_price - buy_price) * pos["Qty"]
+                pnl_pct = ((curr_price - buy_price) / buy_price) * 100
+                
+                raw_tsl = max(ema10, ema20) if curr_price > buy_price else init_sl
+                active_tsl = max(init_sl, raw_tsl * 0.995)
+                tsl_dist = ((curr_price - active_tsl) / curr_price) * 100
+                
+                if curr_price <= init_sl:
+                    rec = "🚨 EXIT NOW (SL Hit)"
+                elif curr_price <= active_tsl:
+                    rec = "⚠️ TRAIL SL BROKEN (Exit)"
+                elif curr_price > buy_price and ema10 > ema20:
+                    rec = "🔥 RIDE THE RALLY" if pnl_pct >= 5.0 else "🟢 HOLD & RIDE"
+                else:
+                    rec = "🟡 HOLD"
+
+                with st.container(border=True):
+                    r1_c1, r1_c2 = st.columns([2, 1])
+                    r1_c1.markdown(f"### {pos['Ticker']}")
+                    if pnl >= 0:
+                        r1_c2.success(f"₹{pnl:+.2f} ({pnl_pct:+.1f}%)")
+                    else:
+                        r1_c2.error(f"₹{pnl:+.2f} ({pnl_pct:+.1f}%)")
+                    
+                    r2_c1, r2_c2 = st.columns(2)
+                    r2_c1.write(f"**Buy:** ₹{buy_price:.2f} | **Qty:** {pos['Qty']}\n\n**Live:** ₹{curr_price:.2f}")
+                    r2_c2.write(f"**Initial SL:** ₹{init_sl:.2f}\n\n**Target (1:{rr_ratio:.1f}):** ₹{pos_target:.2f}")
+                    
+                    st.write(f"**Active TSL:** ₹{active_tsl:.2f} (Buffer: {tsl_dist:.1f}%)")
+                    st.caption(f"Status: **{rec}**")
+                    
+                    if st.button("门 Exit Position", key=f"exit_{idx}", type="primary", use_container_width=True):
+                        st.session_state.positions.pop(idx)
+                        save_positions(st.session_state.positions)
+                        st.toast(f"Exited {pos['Ticker']}!")
+                        st.rerun()
+
+        st.divider()
+        st.subheader("📉 Trailing SL Chart Inspector")
+        active_tickers = [p["Ticker"] for p in st.session_state.positions]
+        
+        pos_select = st.selectbox("Select Active Position:", active_tickers, index=0)
+        selected_pos_data = next((p for p in st.session_state.positions if p["Ticker"] == pos_select), None)
+        
+        if selected_pos_data and pos_select in pos_data_dict:
+            df_pos_chart = pos_data_dict[pos_select]
+            e10_c = float(df_pos_chart['EMA_10'].iloc[-1])
+            e20_c = float(df_pos_chart['EMA_20'].iloc[-1])
+            tsl_line_val = max(selected_pos_data["Initial_SL"], min(e10_c, e20_c))
+            
+            b_p = selected_pos_data["Buy_Price"]
+            r_p = max(b_p - selected_pos_data["Initial_SL"], b_p * 0.01)
+            t_p = b_p + (r_p * rr_ratio)
+
+            fig_p = go.Figure()
+            fig_p.add_trace(go.Candlestick(
+                x=df_pos_chart.index,
+                open=df_pos_chart['Open'], high=df_pos_chart['High'], low=df_pos_chart['Low'], close=df_pos_chart['Close'],
+                name="Price"
+            ))
+            fig_p.add_trace(go.Scatter(x=df_pos_chart.index, y=df_pos_chart['EMA_10'], line=dict(color='orange', width=2), name="10 EMA"))
+            fig_p.add_trace(go.Scatter(x=df_pos_chart.index, y=df_pos_chart['EMA_20'], line=dict(color='blue', width=2), name="20 EMA"))
+
+            fig_p.add_hline(y=b_p, line_dash="dash", line_color="green", annotation_text="BUY")
+            fig_p.add_hline(y=tsl_line_val, line_dash="solid", line_color="orange", annotation_text="TSL")
+            fig_p.add_hline(y=t_p, line_dash="dash", line_color="cyan", annotation_text="TGT")
+
+            fig_p.update_layout(
+                title=f"{pos_select} — Trailing Stop Loss & Target Inspector",
+                yaxis_title="Price (INR)",
+                xaxis_rangeslider_visible=False,
+                template="plotly_dark",
+                height=420,
+                margin=dict(l=10, r=10, t=35, b=10)
+            )
+            st.plotly_chart(fig_p, use_container_width=True, config={'responsive': True})
+
+        if st.button("🗑️ Clear All Positions", use_container_width=True):
+            st.session_state.positions = []
+            save_positions([])
+            st.toast("Cleared all open positions!")
+            st.rerun()
